@@ -1,0 +1,174 @@
+---
+- name: Automate setup for containers on localhost
+  hosts: localhost
+  become: yes
+  vars:
+    domain: "localhost.example.local"
+    subdomains:
+      - "public.example1.local"
+      - "public.example2.local"
+      - "public.example3.local"
+      - "public.example4.local"
+      - "public.example5.local"
+    ansible_user: "ansible_user"
+    certbot_email: "your_email@example.com"
+    traefik_dashboard_port: 8080
+    container_ports:
+      - "81"
+    ssl_cert_dir: "/etc/ssl/certs"
+    ssl_key_dir: "/etc/ssl/private"
+
+  tasks:
+    # Step 1: Create user 'ansible_user'
+    - name: Create user 'ansible_user'
+      user:
+        name: "{{ ansible_user }}"
+        password: "{{ 'your_password' | password_hash('sha512') }}"
+        state: present
+
+    # Step 2: Install Docker and Docker Compose
+    - name: Install Docker and Docker Compose
+      apt:
+        name:
+          - docker.io
+          - docker-compose
+        state: present
+        update_cache: yes
+
+    # Step 3: Add HashiCorp GPG key
+    - name: Download and add HashiCorp GPG key
+      shell: |
+        wget -qO- https://apt.releases.hashicorp.com/gpg | sudo apt-key add -
+
+    # Step 4: Add HashiCorp repository
+    - name: Add HashiCorp APT repository
+      apt_repository:
+        repo: "deb https://apt.releases.hashicorp.com {{ ansible_distribution_release | lower }} main"
+        state: present
+
+    # Step 5: Update apt package index after adding HashiCorp repository
+    - name: Update apt package index after adding HashiCorp repository
+      apt:
+        update_cache: yes
+
+    # Step 6: Install Nomad
+    - name: Install Nomad package
+      apt:
+        name: nomad
+        state: present
+
+    # Step 7: Deploy Traefik job using Nomad
+    - name: Deploy Traefik job using Nomad
+      copy:
+        dest: /etc/nomad.d/traefik.nomad
+        content: |
+          job "traefik" {
+            datacenters = ["dc1"]
+            type = "service"
+            group "traefik" {
+              task "traefik" {
+                driver = "docker"
+                config {
+                  image = "traefik:v2.9"  # Updated Traefik version
+                  ports = ["http", "traefik-dashboard"]
+                }
+                resources {
+                  cpu    = 500
+                  memory = 256
+                }
+                service {
+                  name = "traefik"
+                  tags = ["http"]
+                  port = "http"
+                  check {
+                    http = "http://localhost:8080"
+                    interval = "10s"
+                    timeout = "2s"
+                  }
+                }
+              }
+            }
+          }
+      notify:
+        - Restart Nomad
+
+    # Step 8: Install Nginx
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    # Step 9: Set up Nginx configuration for HTTPS redirects
+    - name: Create Nginx configuration for HTTPS redirection
+      copy:
+        dest: /etc/nginx/sites-available/default
+        content: |
+          {% for subdomain in subdomains %}
+          server {
+              listen 80;
+              server_name {{ subdomain }};
+              location / {
+                  return 301 https://$server_name$request_uri;
+              }
+          }
+          server {
+              listen 443 ssl;
+              server_name {{ subdomain }};
+              ssl_certificate {{ ssl_cert_dir }}/{{ subdomain }}.crt;
+              ssl_certificate_key {{ ssl_key_dir }}/{{ subdomain }}.key;
+              location / {
+                  proxy_pass http://localhost:8080;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+          {% endfor %}
+        mode: '0644'
+
+    # Step 10: Install Certbot for SSL/TLS certificates
+    - name: Install Certbot
+      apt:
+        name: certbot
+        state: present
+
+    # Step 11: Obtain SSL certificates using Certbot
+    - name: Obtain SSL certificates using Certbot
+      command: >
+        certbot certonly --standalone -d {{ item }} --non-interactive --agree-tos -m {{ certbot_email }}
+      with_items: "{{ subdomains }}"
+      register: certbot_results
+      failed_when: certbot_results.rc != 0
+      ignore_errors: yes
+
+    # Step 12: Generate self-signed certificates if Certbot fails
+    - name: Generate self-signed certificates for local domains
+      shell: |
+        openssl req -new -x509 -sha256 -days 365 -nodes -out {{ ssl_cert_dir }}/{{ item }}.crt -keyout {{ ssl_key_dir }}/{{ item }}.key -subj "/CN={{ item }}"
+      with_items: "{{ subdomains }}"
+      when: certbot_results is failed
+
+    # Step 13: Reload Nginx to apply new configuration
+    - name: Test Nginx configuration before reloading
+      command: nginx -t
+      ignore_errors: yes
+      register: nginx_test
+
+    - name: Reload Nginx to apply new configuration
+      systemd:
+        name: nginx
+        state: reloaded
+      when: nginx_test.rc == 0
+
+    # Step 14: Restart Nginx to ensure proper functioning
+    - name: Restart Nginx to ensure proper functioning
+      systemd:
+        name: nginx
+        state: restarted
+
+  handlers:
+    - name: Restart Nomad
+      systemd:
+        name: nomad
+        state: restarted
